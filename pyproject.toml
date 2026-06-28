@@ -1,0 +1,18 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "piLM"
+version = "0.1.0"
+description = "piLM: Ecpu+Eram collaborative inference engine (Python scheduler + C kernel)"
+requires-python = ">=3.10"
+
+[tool.setuptools]
+packages = ["piLM", "piLM.abi", "piLM.runtime", "piLM.runtime.device"]
+
+[tool.setuptools.package-dir]
+"piLM" = "src"
+"piLM.abi" = "src/abi"
+"piLM.runtime" = "src/runtime"
+"piLM.runtime.device" = "src/runtime/device"

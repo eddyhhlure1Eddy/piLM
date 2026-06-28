@@ -1,0 +1,44 @@
+# Build artifacts
+src/ecpu/build/
+**/build/
+*.dll
+*.so
+*.dylib
+*.obj
+*.o
+*.a
+*.lib
+*.exe
+
+# Reference source (large, read-only)
+refs/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+.pytest_cache/
+.mypy_cache/
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# OS
+Thumbs.db
+.DS_Store
+desktop.ini
+
+# CMake
+CMakeCache.txt
+CMakeFiles/
+cmake_install.cmake
+*.cmake.user
+
+# Logs
+*.log

@@ -1,0 +1,44 @@
+* text=auto
+
+# Keep source and documentation stable across Windows/Linux checkouts.
+*.c text eol=lf
+*.h text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.py text eol=lf
+*.sh text eol=lf
+*.md text eol=lf
+*.toml text eol=lf
+*.yml text eol=lf
+*.yaml text eol=lf
+CMakeLists.txt text eol=lf
+*.cmake text eol=lf
+.gitignore text eol=lf
+.gitattributes text eol=lf
+
+# Windows entry points stay native.
+*.ps1 text eol=crlf
+*.bat text eol=crlf
+*.cmd text eol=crlf
+
+# Binary outputs and model/data blobs are never line-ending normalized.
+*.dll binary
+*.so binary
+*.dylib binary
+*.lib binary
+*.a binary
+*.obj binary
+*.o binary
+*.exe binary
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.webp binary
+*.safetensors binary
+*.gguf binary
+*.bin binary
+*.pt binary
+*.pth binary
+*.onnx binary
+*.npy binary
+*.npz binary

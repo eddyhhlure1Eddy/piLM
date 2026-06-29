@@ -7,11 +7,18 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
+option(ECPU_NATIVE_ARCH "Compile kernels for the build host CPU" ON)
+
 if(MSVC)
     add_compile_options(/O2 /W3)
 else()
-    add_compile_options(-O3 -Wall -Wextra -march=native)
+    add_compile_options(-O3 -Wall -Wextra)
+    if(ECPU_NATIVE_ARCH)
+        add_compile_options(-march=native)
+    endif()
 endif()
+
+find_package(OpenMP)
 
 set(ECPU_SOURCES
     src/core/ecpu.c
@@ -25,6 +32,10 @@ set(ECPU_SOURCES
 
 add_library(ecpu SHARED ${ECPU_SOURCES})
 target_include_directories(ecpu PUBLIC include)
+if(OpenMP_C_FOUND)
+    target_link_libraries(ecpu PUBLIC OpenMP::OpenMP_C)
+    target_compile_definitions(ecpu PRIVATE ECPU_HAS_OPENMP=1)
+endif()
 
 if(MSVC)
     set_target_properties(ecpu PROPERTIES OUTPUT_NAME "ecpu" SUFFIX ".dll")

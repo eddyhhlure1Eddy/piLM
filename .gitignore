@@ -1,6 +1,8 @@
 # Build artifacts
 src/ecpu/build/
+src/ecpu/build_*/
 **/build/
+artifacts/
 *.dll
 *.so
 *.dylib
@@ -13,6 +15,21 @@ src/ecpu/build/
 # Reference source (large, read-only)
 refs/
 
+# Model weights and local runtime data
+*.safetensors
+*.gguf
+*.bin
+*.pt
+*.pth
+*.onnx
+*.npy
+*.npz
+
+# Local environment and secrets
+.env
+.env.*
+!.env.example
+
 # Python
 __pycache__/
 *.py[cod]
@@ -22,6 +39,18 @@ dist/
 build/
 .pytest_cache/
 .mypy_cache/
+
+# Local benchmark, debug, and ad-hoc test entry points
+src/bench*.py
+src/test_*.py
+**/test_*.py
+src/debug_*.py
+src/compare_logits.py
+src/soak_*.py
+
+# Local handoff and upload notes
+docs/AI_HANDOFF*.md
+docs/git_upload_manifest.md
 
 # IDE
 .vscode/

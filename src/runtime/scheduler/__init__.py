@@ -1,12 +1,13 @@
-"""Scheduler layer: continuous batching and request scheduling.
+"""Scheduler: continuous batching with paged KV cache (ported from vLLM v1)."""
+from .scheduler import Scheduler, SchedulerOutput, ScheduledRequest
+from .async_scheduler import AsyncScheduler, AsyncSchedulerConfig
+from .kv_cache_manager import KVCacheManager
+from .block_pool import BlockPool
+from .block import KVCacheBlock, FreeKVCacheBlockQueue, DEFAULT_BLOCK_SIZE, hash_block_tokens
+from .request import Request, FCFSQueue, PriorityHeap, RequestStatus
 
-Design:
-  - block_pool: block allocation, refcount, free-list management
-  - kv_cache_manager: slot allocation, prefix-cache lookup
-  - scheduler: prefill+decode mixed batching, preemption policy
-  - request_queue: FCFS / Priority queue
-  - block_table: slot_mapping computation for kernel consumption
-
-All device-agnostic pure-Python logic.
-The C kernel (Ecpu) consumes the resulting block_table + slot_mapping tensors.
-"""
+__all__ = ["Scheduler", "SchedulerOutput", "ScheduledRequest",
+           "AsyncScheduler", "AsyncSchedulerConfig",
+           "KVCacheManager", "BlockPool", "KVCacheBlock", "FreeKVCacheBlockQueue",
+           "DEFAULT_BLOCK_SIZE", "hash_block_tokens",
+           "Request", "FCFSQueue", "PriorityHeap", "RequestStatus"]

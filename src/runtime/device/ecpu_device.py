@@ -1,5 +1,8 @@
 from .base import Device, DeviceInfo
-from .. import _abi as abi
+try:
+    from ... import _abi as abi
+except ImportError:
+    import _abi as abi
 
 class EcpuDevice(Device):
     def __init__(self):

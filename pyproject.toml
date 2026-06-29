@@ -9,10 +9,27 @@ description = "piLM: Ecpu+Eram collaborative inference engine (Python scheduler 
 requires-python = ">=3.10"
 
 [tool.setuptools]
-packages = ["piLM", "piLM.abi", "piLM.runtime", "piLM.runtime.device"]
+packages = [
+    "piLM",
+    "piLM.abi",
+    "piLM.runtime",
+    "piLM.runtime.device",
+    "piLM.runtime.kvcache",
+    "piLM.runtime.loader",
+    "piLM.runtime.scheduler",
+    "piLM.models",
+    "piLM.models.base",
+    "piLM.models.qwen3",
+]
 
 [tool.setuptools.package-dir]
 "piLM" = "src"
 "piLM.abi" = "src/abi"
 "piLM.runtime" = "src/runtime"
 "piLM.runtime.device" = "src/runtime/device"
+"piLM.runtime.kvcache" = "src/runtime/kvcache"
+"piLM.runtime.loader" = "src/runtime/loader"
+"piLM.runtime.scheduler" = "src/runtime/scheduler"
+"piLM.models" = "src/models"
+"piLM.models.base" = "src/models/base"
+"piLM.models.qwen3" = "src/models/qwen3"

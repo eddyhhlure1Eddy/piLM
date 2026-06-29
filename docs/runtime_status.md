@@ -1,0 +1,440 @@
+# piLM Runtime Status
+
+Last updated: 2026-06-29
+
+## Completed Checklist
+
+- Model loading:
+  - Uses meta initialization plus `safetensors.safe_open`.
+  - Qwen3 text weights load 427 / 427 implemented tensors.
+  - `w8a32` quantizes 248 Linear tensors and leaves `lm_head` BF16.
+  - `w8a32-all` quantizes 249 Linear tensors including `lm_head`.
+  - `w8a32-static` is a static mixed-precision policy: keep sensitive Linear modules BF16 and quantize the high-cost middle projections to W8.
+  - `w4a16-static` keeps the same static BF16-sensitive layer policy and packs selected high-cost Linear weights to signed int4.
+  - `w4a16-all` quantizes all eligible Linear tensors, including `lm_head`, to W4A16.
+  - `w4a16g32-static` and `w4a16g128-static` add block/group scales for selected W4 Linear weights.
+- Chat template:
+  - `SimpleTokenizer` delegates to `AutoTokenizer.apply_chat_template`.
+  - `tokenizer_config.json` / `chat_template.jinja` from the checkpoint are followed instead of hardcoding a local template.
+- Persistent runtime:
+  - CLI: `python -m piLM D:\Qwen3.5-9B "hello" --quantize w8a32-all --kv-cache-gb 0.5`
+  - Interactive CLI: `python -m piLM D:\Qwen3.5-9B -i --quantize w8a32-all --kv-cache-gb 0.5`
+  - Server: `python -m piLM.server D:\Qwen3.5-9B --host 127.0.0.1 --port 8028 --quantize w8a32-all --omp-threads 16 --torch-interop-threads 1 --kv-cache-gb 0.5`
+  - Cache-backed server: `python -m piLM.server D:\Qwen3.5-9B --host 127.0.0.1 --port 8028 --quantize w8a32-all --omp-threads 16 --torch-interop-threads 1 --kv-cache-gb 0.5 --w8a32-cache --w8a32-cache-dir D:\Qwen3.5-9B\.pilm_cache\w8a32_st`
+  - Decode RMSNorm experiment: add `--norm-backend ckernel`; use `--norm-backend ckernel-all` only for profiling.
+  - Endpoints: `GET /health`, `POST /generate`, `POST /chat`, `POST /clear`, `POST /profile`, `POST /v1/chat/completions`.
+- C/eCPU kernel path:
+  - Python ABI exposes `ekernel_gemm`, `ekernel_linear_w8a32`, and `ekernel_linear_w8a16_bf16`.
+  - Quantized BF16 CPU Linear calls route through `ckernel_w8a16_bf16`.
+  - W8A16-BF16 AVX2 decode path groups 8 output rows.
+  - Python ABI/runtime now expose `ekernel_rmsnorm_bf16`; `PILM_NORM_BACKEND=ckernel` routes single-row BF16 CPU `RMSNorm` / `GemmaRMSNorm` through the C kernel.
+  - `PILM_NORM_BACKEND=ckernel-all` forces multi-row RMSNorm through the C kernel for experiments.
+  - RMSNorm remains opt-in because it is faster for single-token decode shapes but slower for larger row batches.
+  - Python ABI/runtime also expose experimental `ekernel_linear_w8a16_bf16_argmax` for greedy lm_head argmax without materializing logits.
+  - `PILM_LM_HEAD_ARGMAX=1` enables the experimental greedy lm_head path; it is off by default because larger-vocab microbenchmarks were slower than the existing full-logits path.
+  - `ECPU_W8A16_M_FLAT=1` enables experimental flat OpenMP scheduling for M>1 W8A16 calls; CLI/bench/server expose it as `--w8a16-m-flat`.
+  - Experimental `ekernel_swiglu_bf16` is exposed for BF16 `silu(gate) * up`; it is not enabled by default because target-shape microbenchmarks were slower than PyTorch.
+  - Experimental `ekernel_swiglu_w4a16_bf16` is exposed for one-call M=1 per-row W4 SwiGLU MLP fusion behind `PILM_W4_SWIGLU_FUSED=1`; it is default-off and was built only in isolated `src\ecpu\build_w4swiglu\libecpu.dll`.
+  - `GET /health` now reports `runtime.kernel_backend`, `ckernel_available`, quantized Linear count, cached Linear count, and fused SwiGLU count.
+  - `GET /health` also reports `runtime.ckernel_info`: loaded `libecpu` path, eCPU version, detected ISA, and per-kernel symbol availability.
+  - `ckernel_available` is validated against the loaded DLL symbols required by the selected quantization mode instead of only checking that the Python wrapper imports.
+  - New processes also report `runtime.norm_backend`.
+- Quantized MLP:
+  - Quantized SwiGLU is fused by default for W8 and W4 per-row modes.
+  - `w4a16-all` now fuses 32 MLP blocks through `QuantizedW4A16SwiGLU`.
+  - `PILM_FUSE_SWIGLU=0` disables fusion for comparison.
+  - An adaptive decode-only separate gate/up experiment was tested and not kept because the microbench result was unstable.
+- W8A32 cache:
+  - `PILM_W8A32_CACHE=1` uses per-linear `.safetensors` cache files under `PILM_W8A32_CACHE_DIR`.
+  - Server/CLI/bench now also expose explicit `--w8a32-cache` and `--w8a32-cache-dir` flags.
+  - Cache-loaded tensors are cloned into normal CPU memory before being registered as model buffers, avoiding long-lived safetensors mmap/file-backed storage.
+  - `PILM_TRIM_WORKING_SET=0` disables Windows `EmptyWorkingSet` after quantized loading; this stabilized the cache-backed server in the latest 180 second soak.
+  - The W8 loader also honors `PILM_TRIM_WORKING_SET=0` between shards.
+  - Static BF16-retained tensors are copied out of safetensors storage before registration to avoid Windows `torch_cpu.dll` access violations during mixed BF16/W8 loading.
+- Static mixed precision:
+  - `w8a32-static` keeps `lm_head`, first/last 2 transformer blocks, all full-attention projections, and linear-attention gate/decay projections in BF16.
+  - Middle MLP projections and linear-attention `in_proj_qkv` / `out_proj` use W8 weight-only quantization and the same C kernel path.
+  - `PILM_STATIC_PROTECT_LAYERS` controls how many leading/trailing blocks stay BF16; default is 2.
+- W4A16 static path:
+  - `w4a16-static` uses signed int4 values in `[-7, 7]`, packed two weights per byte, plus one FP32 scale per output row.
+  - `w4a16g32-static` uses one FP32 scale per 32 input-channel weights.
+  - `w4a16g128-static` uses one FP32 scale per 128 input-channel weights.
+  - Python ABI exposes `ekernel_linear_w4a16_bf16`; set `PILM_ECPU_LIB` to test a newly built eCPU library without replacing a DLL held by a running server.
+  - Python ABI also exposes `ekernel_linear_w4a16g32_bf16` and `ekernel_linear_w4a16g128_bf16`.
+  - New Python processes search stable `src/ecpu/build` before experimental `src/ecpu/build_w4`, while `PILM_ECPU_LIB` remains the highest-priority override.
+  - W4 modes set `PILM_ECPU_LIB` to `src/ecpu/build_w4/libecpu.dll` automatically when no explicit `PILM_ECPU_LIB` is set.
+  - W4 per-row decode now has an AVX2 8-output-row dot path in `ekernel_linear_w4a16_bf16`.
+  - Experimental `ekernel_linear_w4a16_bf16_b8` keeps W4 at 4-bit density but repacks weights into 8-output-row x 16-K tiles. It is routed only with `PILM_W4_B8=1` and an isolated DLL such as `src\ecpu\build_w4b8\libecpu.dll`; live default remains row-major `build_w4`.
+  - `PILM_W4A16_CACHE=1` and `PILM_W4A16_CACHE_DIR=...` enable W4 safetensors cache.
+  - W4 cache payload is `qweight:uint8`, `scales:float32`, and `in_features:int32`.
+  - `scripts\export_pilm_quant_bundle.py` exports a compressed piLM bundle with W4 Linear cache, residual BF16 tensors, tokenizer/config files, and optional MTP BF16 tensors.
+  - The current W4 format is a simple per-row format. It is not yet llama.cpp-style block/super-block W4K, so quality loss is expected to be higher than W8 until block scales are added.
+  - G32/G128 are intermediate block-scale formats. They are closer to llama.cpp-style block quantization than per-row W4, but still do not implement full K-quant super-block metadata.
+- KV/cache correctness:
+  - `--kv-cache-gb` / `PILM_KV_CACHE_GB` controls physical KV allocation.
+  - Physical KV uses `torch.empty`; only written slots are read.
+  - Scheduler chunks do not cross KV block boundaries.
+  - Full attention gathers all needed KV blocks and avoids `torch.cat` for one-block reads.
+  - Global prefix cache is off by default because Qwen3.5 linear-attention recurrent state also must be reused.
+- Scheduler async strategy:
+  - `runtime.scheduler.AsyncScheduler` wraps the synchronous `Scheduler` with an `asyncio.Lock` and waitable work event.
+  - Async APIs cover `add_request`, `add_requests`, `schedule`, `schedule_loop`, `update_from_output`, `finish_request`, `abort_request`, and `stats`.
+  - The synchronous scheduler remains unchanged; async strategy serializes state mutations and is ready for future async HTTP/WebSocket workers.
+- Session reuse:
+  - `/chat` keeps a per-session request, full-attention KV, conv state, and recurrent state.
+  - Later turns append only the tokenized suffix when the prior token stream matches.
+  - `/clear` releases pinned session KV.
+- Linear-attention optimizations:
+  - Recurrent state stays FP32 across decode steps.
+  - Single-token conv update avoids `torch.cat` and zero padding.
+  - Single-token recurrent update now uses `torch.bmm` instead of three `torch.einsum` calls.
+- RoPE optimizations:
+  - `apply_rope` caches `inv_freq` by device/head shape/theta.
+  - Single-position decode also caches RoPE `cos/sin` by position, avoiding repeated trigonometric setup across full-attention layers.
+- Tests passing in this run:
+  - `python src\test_linear_attention_parity.py`
+  - `python src\test_quant.py`
+  - `python src\test_session_reuse.py`
+  - `python src\test_engine_generate.py`
+  - `python src\test_full_attention_kv_blocks.py`
+  - `python src\test_rmsnorm.py`
+  - `python src\test_rope.py`
+  - `python src\runtime\scheduler\test_scheduler.py` including async wait/concurrent-add coverage
+
+## Current Server
+
+- URL: `http://127.0.0.1:8028`
+- PID: 36240
+- Model dir: `D:\Qwen3.5-9B-pilm-w4a16-all`
+- Quantize: `w4a16-all`
+- OMP/Torch/inter-op threads: 24 / 24 / 1
+- KV cache: 0.25 GB, 128 blocks x 16 tokens
+- Load time: 21.1597 sec from the 6.0727 GiB compressed bundle with `PILM_TRIM_WORKING_SET=0`
+- Logs: `D:\self-infer\artifacts\logs\server_8028_best.out.log`, `D:\self-infer\artifacts\logs\server_8028_best.err.log`
+- Latest health:
+  - `runtime.kernel_backend`: `ckernel_w4a16_bf16`
+  - `runtime.ckernel_available`: `true`
+  - `runtime.ckernel_info.library_path`: `D:\self-infer\src\ecpu\build_w4\libecpu.dll`
+  - `runtime.ckernel_info.isa`: `avx2`
+  - `runtime.ckernel_info.symbols.ekernel_linear_w4a16_bf16`: `true`
+  - `runtime.ckernel_info.symbols.ekernel_linear_w4a16_bf16_i4b8`: `false`
+  - `runtime.ckernel_info.symbols.ekernel_linear_w4a16_bf16_q8`: `false`
+  - `runtime.ckernel_info.symbols.ekernel_linear_w8a16_bf16_q8`: `false`
+  - `torch_interop_threads`: 1
+  - `runtime.quantized_linear_modules`: 249
+  - `runtime.cached_linear_modules`: 249
+  - `runtime.bf16_linear_modules`: 0
+  - `runtime.trim_working_set`: `false`
+  - `runtime.fused_swiglu_modules`: 32
+  - `runtime.norm_backend`: `ckernel-all`
+  - `runtime.mtp_draft_enabled`: `false`
+  - `runtime.prefix_cache_enabled`: `false`
+  - `runtime.w8a16_m_flat`: `false`
+
+## Latest Measurements
+
+- Current best W4 compressed bundle path, `D:\Qwen3.5-9B-pilm-w4a16-all`, `w4a16-all`, no MTP, 24 OMP threads, `PILM_LINEAR_ATTN_RECURRENT_BACKEND=ckernel`, W4 fused SwiGLU:
+  - 32-token standalone bench: load 7.2558 sec, first chunk 1.1418 sec, generate 7.1388 sec, 4.4826 tokens/sec.
+  - 128-token standalone bench: load 7.3821 sec, first chunk 1.1494 sec, generate 26.3002 sec, 4.8669 tokens/sec total; excluding first token, about 5.05 tokens/sec.
+  - Live `/health`: PID 36240, 249 / 249 cached W4 Linear tensors, 32 fused W4 SwiGLU blocks, eCPU DLL `D:\self-infer\src\ecpu\build_w4\libecpu.dll`, ISA `avx2`.
+  - Live `/generate`, prompt `hello`, 16 requested tokens: HTTP wall time 4.6423 sec, about 3.45 tokens/sec including first token and HTTP overhead.
+- W4 optimization deltas on prompt `hello`:
+  - Original direct W4 bundle, 16 tokens, 16 threads: 2.9571 tokens/sec.
+  - W4 AVX2 8-output-row path, 32 tokens, 16 threads: 3.8340 tokens/sec.
+  - W4 fused SwiGLU, 16 tokens, 16 threads: 3.5533 tokens/sec.
+  - Thread sweep on fused W4, 16 tokens: 8t 2.9095, 12t 2.8509, 16t 3.4686, 24t 3.6255, 32t 3.0974 tokens/sec.
+  - Best measured setting is 24 OMP threads; 32 threads regresses.
+- MTP/speculative status:
+  - Implemented 3-draft speculative verification via `PILM_MTP_DRAFT=1`, `PILM_MTP_SPECULATIVE=1`, `PILM_MTP_SPECULATIVE_STEPS=3`.
+  - BF16 MTP, 32 tokens, 24 threads: 3.3538 tokens/sec, 25 attempts, 20 accepts, 5 rejects, 80.0% acceptance. Slower than no-MTP because draft cost is too high.
+  - W4-quantized MTP was tested and rejected: 16 tokens, 8 MTP linears quantized, 0% acceptance, 1.0562 tokens/sec.
+  - Decision: keep MTP 3-draft implemented but disabled for the live service until the draft block has a lower-cost kernel.
+
+- Current cache-backed no-trim live server, `w8a32-all`, 0.5 GB KV:
+  - Load: 10.9901 sec after the latest inter-op restart.
+  - Cached Linear tensors: 249 / 249
+  - Latest restarted 16-thread service with `--torch-interop-threads 1`, Chinese CPU-optimization prompt, 16 chunks: 2.7327, 2.7202, 2.7331, 2.7091, 2.7235 tokens/sec; average 2.7237 tokens/sec.
+  - Latest restarted 16-thread `/generate`, Chinese CPU-optimization prompt, 16 chunks: 2.4769, 2.4984, 2.5226 tokens/sec; average 2.4993 tokens/sec.
+  - Same prompt before the latest code restart on 16 threads: 2.6003, 2.6223, 2.6277, 2.6501, 2.6178 tokens/sec; average 2.6236 tokens/sec.
+  - 24-thread restarted service with the same cache and prompt: 2.6631, 2.5672, 2.5832, 2.5465, 2.5444 tokens/sec; average 2.5809 tokens/sec. This did not beat the 16-thread baseline reliably and first-token latency was worse, so 16 threads remains the recommended service setting.
+  - `/generate`, prompt `What is 2+2?`, 16 chunks after clean restart: first token 1.5599 sec, total 6.4855 sec, 2.4670 tokens/sec.
+  - Five warm `/generate` repeats after clean restart: 2.4122, 2.4110, 2.3967, 2.3957, and 2.3922 tokens/sec.
+  - `/generate`, prompt `What is 2+2?`, 16 chunks: first token 0.9296 sec, total 3.6939 sec, 4.3314 tokens/sec.
+  - `/chat`, prompt `What is 2+2?`, 8 chunks: first token 1.7764 sec, total 3.1264 sec, 2.5588 tokens/sec
+  - `/profile`, prompt `What is 2+2?`, 4 chunks: first token 0.9947 sec, total 1.6069 sec, 2.4893 tokens/sec under profiling overhead
+  - Module totals from `/profile`: MLP 0.7798 sec, linear attention 0.5119 sec, full attention 0.1523 sec, `lm_head` 0.0865 sec
+  - Warm `/generate`, prompt `What is 2+2?`, 8 chunks: 3.5021 and 3.5959 tokens/sec in two consecutive runs.
+  - Stability: same PID 9284 stayed healthy after an 8-token `/chat`, `/clear`, and a 180 second wait; `free_blocks=255`.
+  - `/clear` returned `free_blocks=255`.
+- Standalone static mixed precision, `w8a32-static`, 0.125 GB KV, cache-backed no-trim:
+  - Load: 10.62 sec in the 16-token bench; direct init check was 13.1368 sec.
+  - Quantized Linear tensors: 126 / 249.
+  - Cached Linear tensors: 126 / 126.
+  - BF16 Linear tensors: 123 / 249.
+  - Fused quantized SwiGLU blocks: 28.
+  - 16 chunks: first chunk 1.1837 sec, generate 4.7965 sec, 3.3357 chunks/sec.
+  - Kernel backend remains `ckernel_w8a16_bf16`.
+- Standalone W4 static mixed precision, `w4a16-static`, 0.125 GB KV, cache-backed no-trim:
+  - First quantizing load: 18.4005 sec, 126 quantized Linear tensors, 0 from cache.
+  - Cache read load: 10.4904 sec for 16-token bench; 10.7760 sec for 1-token check.
+  - Quantized Linear tensors: 126 / 249.
+  - BF16 Linear tensors: 123 / 249.
+  - W4 cache size: 2.465 GB for 126 static-policy tensors.
+  - Existing W8 all cache size: 7.397 GB for 249 tensors.
+  - 16 chunks: first chunk 1.0994 sec, generate 4.4645 sec, 3.5838 chunks/sec.
+  - 1 chunk cache-read check: first chunk 1.2237 sec, generate 1.2241 sec, 0.8169 chunks/sec.
+  - Kernel backend: `ckernel_w4a16_bf16`.
+- Standalone W4 all-Linear quantization, `w4a16-all`, 0.125 GB KV:
+  - First quantizing load from original 17.98 GB checkpoint: 27.7753 sec, 249 quantized Linear tensors, 0 from cache, 0 BF16 Linear tensors.
+  - W4-all Linear cache size: 3.7016 GiB for 249 tensors.
+  - Cache-read load from original model dir: 8.7235 sec, 249 / 249 cached, 16 chunks: first chunk 1.4929 sec, generate 5.3449 sec, 2.9935 chunks/sec on prompt `hello`.
+  - Exported compressed bundle: `D:\Qwen3.5-9B-pilm-w4a16-all`, 6.0727 GiB total.
+  - Bundle contents: 249 W4 Linear cache files, 178 residual BF16 main-model tensors, 15 MTP BF16 tensors, tokenizer/config files.
+  - Direct bundle load works without the original 17.98 GB safetensors: load 7.4601 sec, 16 chunks 2.9571 chunks/sec on prompt `hello`.
+  - Live bundle service on `127.0.0.1:8028`, PID 35252, loads in 7.5488 sec with 249 / 249 cached Linear tensors.
+  - Live bundle service, Chinese CPU-optimization prompt, 16 chunks: 2.5080, 2.3723, 2.4332, 2.4397, 2.4098 chunks/sec; average 2.4326 chunks/sec.
+- Standalone W4 G32 static mixed precision, `w4a16g32-static`, 0.125 GB KV, cache-backed no-trim:
+  - Cache read load: 15.3367 sec.
+  - Quantized Linear tensors: 126 / 249.
+  - BF16 Linear tensors: 123 / 249.
+  - W4G32 cache size: 3.076 GB for 126 static-policy tensors.
+  - 16 chunks: first chunk 1.6964 sec, generate 7.3227 sec, 2.1850 chunks/sec.
+  - Kernel backend: `ckernel_w4a16g32_bf16`.
+  - The experimental cache was deleted after measurement because G32 is not the recommended speed path and consumed 3.076 GB.
+- Standalone W4 G128 static mixed precision, `w4a16g128-static`, 0.125 GB KV, cache-backed no-trim:
+  - First quantizing load: 33.5671 sec, 126 quantized Linear tensors, 0 from cache.
+  - Cache read load: 14.4514 sec for 16-token bench.
+  - Quantized Linear tensors: 126 / 249.
+  - BF16 Linear tensors: 123 / 249.
+  - W4G128 cache size: 2.615 GB for 126 static-policy tensors.
+  - 16 chunks: first chunk 1.5131 sec, generate 6.5237 sec, 2.4526 chunks/sec.
+  - Kernel backend: `ckernel_w4a16g128_bf16`.
+- Standalone module profile after `bmm` recurrent update, prompt `What is 2+2?`, 4 chunks, `w8a32-all`, 0.5 GB KV:
+  - Load: 18.1628 sec
+  - First chunk: 3.2193 sec
+  - Generate: 3.9670 sec
+  - Throughput: 1.0083 chunks/sec
+  - Module totals: MLP 2.2371 sec, linear attention 1.1441 sec, full attention 0.3310 sec, `lm_head` 0.1564 sec
+  - Previous comparable profile before the `bmm` recurrent update: generate 4.1559 sec, linear attention 1.2216 sec
+- Live server `/generate`, prompt `What is 2+2?`, 8 chunks, after restart with health runtime fields:
+  - Request 1: first chunk 3.3309 sec, total 5.1158 sec, 1.5638 chunks/sec
+  - Request 2: first chunk 2.7471 sec, total 4.5266 sec, 1.7673 chunks/sec
+  - Warm repeats: first chunk 2.7369 / 2.7305 sec, total 4.5187 / 4.4986 sec, 1.7704 / 1.7783 chunks/sec
+  - `engine_stats.kernel_backend`: `ckernel_w8a16_bf16`
+- Live server `/profile`, prompt `What is 2+2?`, 4 chunks:
+  - First chunk: 1.8807 sec
+  - Total: 2.4402 sec
+  - Throughput: 1.6392 chunks/sec under profiling overhead
+  - Module totals: MLP 1.4125 sec, linear attention 0.6748 sec, full attention 0.2064 sec, `lm_head` 0.0772 sec
+  - Follow-up `/generate` worked normally, confirming profile wrappers are restored.
+- Experimental BF16 SwiGLU activation C kernel:
+  - Shape M=1,N=12288: C 0.00007023 sec vs PyTorch 0.00004065 sec, 0.58x; not enabled.
+  - Shape M=16,N=12288: C 0.00022289 sec vs PyTorch 0.00009883 sec, 0.44x; not enabled.
+  - Correctness check is covered by `python src\test_quant.py` with max abs error 0.00390625 in the small test.
+- Opt-in BF16 RMSNorm C kernel:
+  - Correctness: `python src\test_rmsnorm.py` passed for direct kernel calls and model-layer dispatch; max abs error was 0.0 in the small direct/layer checks.
+  - Shape M=1,N=4096, Gemma RMSNorm, 16 threads: C 0.00000952 sec vs PyTorch 0.00002354 sec, 2.4718x.
+  - Shape M=1,N=256, Gemma RMSNorm, 16 threads: C 0.00000868 sec vs PyTorch 0.00001873 sec, 2.1570x.
+  - Shape M=16,N=4096, Gemma RMSNorm, 16 threads: C 0.00013092 sec vs PyTorch 0.00010025 sec, 0.7658x.
+  - Standalone full-model comparison was attempted but failed before generation with Windows `os error 1455` page-file exhaustion while another 9B server was resident.
+- RoPE cache microbench:
+  - Shape seq=1, heads=32, kv_heads=4, head_dim=256: cached 0.00007589 sec vs uncached reference 0.00009945 sec, 1.3105x.
+  - Shape seq=8, heads=32, kv_heads=4, head_dim=256: cached 0.00018847 sec vs uncached reference 0.00020978 sec, 1.1131x.
+  - Correctness: `python src\test_rope.py` passed with max abs error 0.0 for seq=1 and seq=8.
+- Experimental greedy lm_head direct argmax:
+  - Correctness: `python src\test_quant.py` compares direct W8A16 argmax with full W8A16 logits argmax; `python src\test_engine_generate.py` verifies the Engine path behind `PILM_LM_HEAD_ARGMAX=1`.
+  - Shape M=1,N=65536,K=4096: direct argmax 0.006430 sec vs full logits+argmax 0.006935 sec, 1.0784x.
+  - Shape M=1,N=151936,K=4096: direct argmax 0.019066 sec vs full logits+argmax 0.016507 sec, 0.8658x.
+  - Decision: keep this path available for experiments but disabled by default; the larger-vocab result shows the next real lm_head win needs better weight layout/reduction, not just skipping logits materialization.
+- Experimental W8A16 interleaved8 prepack:
+  - Added `ekernel_linear_w8a16_bf16_i8b8` plus Python pack/wrapper for isolated benchmarking only.
+  - Shape M=1,N=24576,K=4096: row-major 0.002407 sec vs interleaved8 0.002850 sec, 0.8447x.
+  - Shape M=1,N=4096,K=12288: row-major 0.001100 sec vs interleaved8 0.001279 sec, 0.8603x.
+  - Decision: do not integrate this prepack layout into model loading; the current row-major 8-output-row dot kernel remains better on this AVX2 host.
+- Experimental W8A16 M>1 flat OpenMP scheduling:
+  - Motivation: the stable M>1 path opened one OpenMP parallel region per activation row, which hurts prefill/first-token MLP calls such as M=16.
+  - Shape M=16,N=24576,K=4096: default 0.049189 sec vs flat 0.026493 sec, 1.857x faster; flat is near torch BF16 at 0.025947 sec.
+  - Shape M=16,N=4096,K=12288: default 0.017014 sec vs flat 0.006354 sec, 2.678x faster; flat is 1.9916x faster than torch BF16 at 0.012654 sec.
+  - Correctness: `python src\test_quant.py` passed with `ECPU_W8A16_M_FLAT=1`.
+  - Restarted full-model server with `build_w4` plus `--w8a16-m-flat` was stable but slower: 16-token `/generate` was about 2.24 tokens/sec, and `/profile` showed MLP 1.6539 sec.
+  - Restarted full-model server with stable `build` DLL plus `--w8a16-m-flat` was also slower than the historical best: 16-token `/generate` was about 2.53 tokens/sec, with MLP 1.2621 sec in `/profile`.
+  - Decision: do not enable `--w8a16-m-flat` by default. The isolated M=16 microbench is strong, but end-to-end decode does not improve and can regress.
+  - Related fix: `_abi` now prefers stable `src/ecpu/build` for W8 services; W4 modes explicitly select `build_w4`.
+- W8A16 preconvert retest on stable `src/ecpu/build`:
+  - Keep `ECPU_W8A16_PRECONVERT` disabled.
+  - M=1,N=24576,K=4096: default 0.005322 sec vs preconvert 0.005798 sec.
+  - M=1,N=4096,K=12288: default 0.002016 sec vs preconvert 0.002655 sec.
+  - M=16,N=24576,K=4096: default 0.032440 sec vs preconvert 0.101321 sec.
+  - M=16,N=4096,K=12288: default 0.017546 sec vs preconvert 0.061781 sec.
+- W8A16 thread-count sweep on stable `src/ecpu/build`:
+  - M=1,N=24576,K=4096: 4t 0.004636, 8t 0.003515, 12t 0.003224, 16t 0.003460, 24t 0.002879 sec.
+  - M=1,N=4096,K=12288: 4t 0.001785, 8t 0.001136, 12t 0.001324, 16t 0.001201, 24t 0.001069 sec.
+  - M=16,N=24576,K=4096: 4t 0.032855, 8t 0.016670, 12t 0.019465, 16t 0.019372, 24t 0.015231 sec.
+  - M=16,N=4096,K=12288: 4t 0.015865, 8t 0.007507, 12t 0.006003, 16t 0.004105, 24t 0.004905 sec.
+  - End-to-end 24-thread service testing did not improve the current `/generate` path; the microbench gain is not enough to justify changing the default.
+- Current-source native build retest:
+  - `scripts\build_ecpu_windows.ps1` now passes `-DECPU_NATIVE_ARCH=ON/OFF` correctly; the earlier `build_w4` cache had literal `$nativeArch`.
+  - Built `src\ecpu\build_current\libecpu.dll` from current sources with `ECPU_NATIVE_ARCH=ON`.
+  - Shape M=16,N=4096,K=12288: 0.031282 sec, slower than stable `src\ecpu\build`.
+  - Shape M=1,N=24576,K=4096: 0.005412 sec, not a service improvement.
+  - Decision: keep stable `src\ecpu\build\libecpu.dll` as the default W8 DLL; use current-source DLLs only for isolated experiments until W8 performance parity is restored.
+- Linear attention internal profile:
+  - `/profile` now includes `attention_stage_profile` when `linear_stages=true`.
+  - Latest 4-token profile: linear attention total 0.8265 sec.
+  - Main internal stages: `proj_qkv_z` seq16 0.1879 sec, `proj_qkv_z` seq1 0.1872 sec, recurrent seq16 0.1188 sec, norm/out seq1 0.0811 sec, norm/out seq16 0.0788 sec.
+  - RMSNorm C kernel is not useful for linear-attention norm/out shapes: rows are typically 32 or 512 with dim 128, where the C RMSNorm is slower than PyTorch.
+- Experimental EAttn/GatedDelta recurrent C kernel:
+  - Added `ekernel_gated_delta_recurrent_f32` to the eCPU API and Python wrapper, plus optional `PILM_LINEAR_ATTN_RECURRENT_BACKEND=ckernel` routing.
+  - Built experimental DLL at `src\ecpu\build_eattn\libecpu.dll`; stable service DLLs were not replaced.
+  - Correctness on Qwen3.5 recurrent shape H=32,K=128,V=128: max output error 1.9073e-06, max state error 9.5367e-07.
+  - First row/column loop version was 0.4034x vs PyTorch; optimized contiguous-row scan reached 0.9108x vs PyTorch.
+  - Decision: keep as experimental only; it is not fast enough for default use yet.
+- MTP draft status:
+  - The checkpoint includes `mtp_num_hidden_layers=1` and 15 MTP tensors.
+  - MTP BF16 tensors are exported in the compressed bundle under `mtp_bf16`.
+  - Added `Qwen3MTPDraft` and optional `PILM_MTP_DRAFT=1` loading.
+  - Added 3-draft speculative verification with `PILM_MTP_SPECULATIVE=1` and `PILM_MTP_SPECULATIVE_STEPS=3`.
+  - MTP uses the checkpoint's BF16 tensor order `[embedding, hidden]` for `mtp.fc.weight`; the earlier reversed order gave unusable acceptance.
+  - MTP W4 quantization is available behind `PILM_MTP_QUANTIZE=w4a16`, but it is not default because acceptance fell to 0% in the latest test.
+  - Current decision: MTP remains opt-in and disabled on the live service because BF16 3-draft speculative is slower than no-MTP on this CPU.
+- Experimental W4A16 + on-the-fly int8 activation (pmaddwd) kernel:
+  - Added `ekernel_linear_w4a16_bf16_q8` to the eCPU API and Python wrapper.  It uses the same packed-int4 / per-output-row fp32-scale weight layout as `ekernel_linear_w4a16_bf16`, so it is a drop-in alternative for the same tensors.  Each activation row is quantized to signed int8 with a per-row fp32 scale at call time and the dot product uses an AVX2 `_mm256_madd_epi16` int16->int32 path instead of the BF16-activation `cvtepi8_epi32 + cvtepi32_ps + fmadd` chain.  Built to the isolated `src/ecpu/build_w4q8/libecpu.dll`; the stable `build_w4` DLL was not touched.
+  - Opt-in model routing via `PILM_W4A16_Q8=1` plus `PILM_ECPU_LIB=...\build_w4q8\libecpu.dll`.  Only the per-row W4 path (lm_head, MLP gate/up/down, attention projections) routes through q8; grouped W4 (g32/g128) and all W8 paths are unchanged.  Default off.
+  - Correctness: `python src/test_quant.py` passes against `build_w4q8` (q8-vs-stable-w4 max abs err 0.0049 on the small model; q8-vs-bf16-ref 0.0586, same as stable W4).  Microbench q8-vs-stable-w4 mean abs err is 0.38 on N=12288,K=4096.
+  - Microbench, M=1, 24 OMP threads, `build_w4q8` vs stable `build_w4`:
+    - N=12288,K=4096 (MLP gate/up): stable W4 0.000691s, q8 0.000510s, **1.35x**, 1.30x vs W8, 3.65x vs torch BF16.
+    - N=4096,K=12288 (MLP down): stable W4 0.000644s, q8 0.000543s, **1.19x**, 1.10x vs W8, 3.54x vs torch BF16.
+    - N=151936,K=4096 (lm_head): stable W4 0.007687s, q8 0.007114s, **1.08x**, 1.39x vs W8, 4.03x vs torch BF16.
+  - End-to-end standalone bench, prompt `hello`, 32 tokens, greedy: stable W4 4.5494 chunks/sec, q8 4.7981 chunks/sec (+5.5%), first-token 0.89s vs 1.07s; greedy outputs identical.
+  - End-to-end standalone bench, prompt `What is 2+2? Answer briefly.`, 64 tokens, greedy: stable W4 4.37 chunks/sec, q8 4.74 chunks/sec (+8.5%), first-token 1.60s vs 1.97s.
+  - **Greedy divergence finding (quality):** at 64 tokens the q8 greedy output diverges from stable W4 starting around token 8 ("...Analyze the Request:" then branches).  Stable-vs-stable across two fresh runs is bit-identical (217/217 chars), so the divergence is caused by the int8 activation rounding, not CPU nondeterminism.  Both outputs are coherent and correct; the divergence is the int8 rounding flipping near-tied logits on top of already-coarse W4 weights.
+  - Decision: **keep q8 opt-in and OFF by default for `w4a16-all`.**  The 5-8.5% speed win is real and costless at the microbench level, but stacking int8 activation quantization on top of int4 weights systematically perturbs greedy sampling.  This matches llama.cpp practice, where q8 activations are paired with higher-precision weights (e.g. Q8_0), not with Q4_K.  q8 is available for speed experiments where sampling nondeterminism is acceptable.  A W8-weight + q8-activation path (where the weight is precise enough to absorb the int8 activation error) is the likely next step and is left as future work.
+- Experimental W8A16 + on-the-fly int8 activation (madd_epi16) kernel:
+  - Added `ekernel_linear_w8a16_bf16_q8` to the eCPU API and Python wrapper.  It uses the same int8 per-output-row-scaled weight layout as `ekernel_linear_w8a16_bf16` (drop-in for the same tensors).  Each activation row is quantized to signed int8 with a per-row fp32 scale at call time and the dot product uses an AVX2 `_mm256_madd_epi16` int16->int32 path (both operands sign-extended int8->int16, so it is exact signed*signed with no bias correction), avoiding the stable W8 `cvtepi8_epi32 + cvtepi32_ps + fmadd` chain.  Built to the isolated `src/ecpu/build_w8q8/libecpu.dll`; the stable `build` (W8) and `build_w4` (W4) DLLs were not touched.
+  - Opt-in model routing via `PILM_W8A16_Q8=1` plus `PILM_ECPU_LIB=...\build_w8q8\libecpu.dll`.  Only the BF16 W8 path routes through q8 (`QuantizedW8A32Linear` BF16 branch and `QuantizedW8A32SwiGLU._linear`); the F32 W8A32 path, argmax, i8b8, and all W4 paths are unchanged.  Default off.
+  - Correctness: small-shape q8-vs-stable-w8 mean abs err 0.376 (N=12288,K=4096) and 0.652 (N=4096,K=12288), comparable to W8's own error vs BF16 (0.37/0.65).  Added error is modest, as expected for W8 absorbing int8 activation error.
+  - Microbench, M=1, 24 OMP threads, `build_w8q8` vs stable `build`:
+    - N=24576,K=4096 (MLP gate/up): w8 0.001905s, q8 0.001933s, **0.99x (neutral)**.
+    - N=4096,K=12288 (MLP down): w8 0.000715s, q8 0.000657s, **1.09x**.
+    - N=248320,K=4096 (lm_head): w8 0.022449s, q8 0.017061s, **1.32x**.
+  - Microbench, M=1, 16 OMP threads: N=24576 1.04x, N=4096 0.99x, N=248320 0.95x (lm_head regresses at 16 threads).
+  - Argmax-stability quality signal (per shape, many random activation rows, argmax of stable W8 vs W8+q8):
+    - lm_head (N=248320): 1/32 flips (3.1%), **all flips at margin=0.0 (exact ties only)**; avg stable margin 13.19.
+    - mlp_gate_up (N=24576): 2/64 flips (3.1%), **all at margin=0.0**; avg stable margin 17.44.
+    - mlp_down (N=4096): 0/64 flips (0%); avg stable margin 26.47.
+    - For comparison, W4+q8 flips at **nonzero margins** (lm_head 2/32 at margin 1.0; mlp_down 1/64 at margin 2.0), i.e. W4+q8 perturbs clear decisions while W8+q8 only breaks exact ties.  This is the mechanistic confirmation that W8 weight precision absorbs the int8 activation error, as theorized.
+  - **Full-model greedy quality test now COMPLETE** (the earlier page-file blocker was resolved this session by building a W8 bundle, below):
+    - W8 bundle built at `D:\Qwen3.5-9B-pilm-w8a32-all` (9.77 GiB): 249 pre-quantized per-Linear int8 caches hardlinked under `linear_w8a32/` from the existing `D:\Qwen3.5-9B\.pilm_cache\w8a32_st` cache (verified to cover all 249 quantizable Linears incl `lm_head`), plus streamed BF16 residual + mtp shards.  Loads via `Engine(quantize=w8a32-all)` with the new loader bundle branch (`models/qwen3/weights.py` `load_weights_w8a32_from_safetensors` now points `cache_dir` at `bundle/linear_w8a32/` when a W8 bundle manifest is present) in 8.7s: 249/249 Linear quantized (249 from cache, 0 bf16 linear), 32 SwiGLU fused.  No `os error 1455`; the W4 live server (PID 16988) and `build_w4` DLL were not touched.  Build script: `scripts/export_pilm_quant_bundle_v2.py --quantize w8a32-all`.
+    - Greedy compare, 24 OMP threads, `temperature=0.0`, `top_k=0`, prompts `hello` / 中文 CPU-opt / `What is 2+2? Answer briefly.` × {64, 128} tokens, stable W8 (`build/libecpu.dll`, `PILM_W8A16_Q8=0`) vs W8+q8 (`build_w8q8/libecpu.dll`, `PILM_W8A16_Q8=1`):
+      - **hello / 64:** DIVERGE at index 11. stable margin 0.25, q8 margin 1.5. stable picks 5396 ("Input"), q8 picks 5952 ("Request") — the two were near-tied (stable 28.875 vs 28.625).  mismatches 8/64.
+      - **hello / 128:** DIVERGE at index 11 (same as above), mismatches 89/128.
+      - **中文 CPU-opt / 64:** DIVERGE at index 13. stable margin 0.5, q8 margin 0.125. stable 42903 ("acceleration"), q8 66319 ("accelerating") — near-tied (24.75 vs 24.25).  mismatches 10/65.
+      - **中文 CPU-opt / 128:** DIVERGE at index 13 (same), mismatches 73/129.
+      - **What is 2+2? / 64:** CONSISTENT (0 mismatches, 65/65 identical).
+      - **What is 2+2? / 128:** DIVERGE at index 112. stable margin 0.75, q8 margin 0.125. stable 328 (" + 2 "), q8 264 (" two ").  mismatches 17/129.
+      - Speed (chunks/sec, q8/stable ratio): hello 0.97, 中文 0.90-0.92, 2+2 0.89-0.90 — i.e. W8+q8 is **slower** end-to-end at 24 threads on this bundle (the lm_head microbench win does not survive the full model; MLP gate/up neutrality + overhead dominate).
+    - Mechanism confirmed: every divergence is at a **near-tied** logits pair (stable margin ≤ 0.75; often the two candidates are within 0.5 of each other), exactly as the argmax-stability microbench predicted.  W8 weight precision absorbs *most* of the int8 activation error (W4+q8 diverged at token ~8; W8+q8 survives to token 11-13), but it does **not** eliminate it: exact-tie / near-tie accumulation across 32 layers still flips greedy decisions.
+  - Decision: **W8+q8 is NOT default-enable.**  It diverges from stable W8 greedy on 5 of 6 runs (the only consistent run is the simplest prompt at 64 tokens), and it is **slower** end-to-end (0.89-0.97x), so there is no speed upside to trade quality for.  This closes the q8-activation line of work: q8 activation (on W4 or W8) is marginal-to-negative end-to-end and perturbs greedy sampling.  Keep `PILM_W8A16_Q8` / `PILM_W4A16_Q8` as experimental switches only; do not invest further main-line time in q8 activation.  Artifacts: `artifacts/q8_eval/w8_greedy_stable_24t.json`, `w8_greedy_q8_24t.json`, `w8_greedy_compare_24t.json`.
+- Live `/chat` session reuse check:
+  - First turn: 17 prompt tokens, 4 generated chunks, total 2.6015 sec
+  - Second turn: 38 prompt tokens, `reused_tokens=20`, `appended_prompt_tokens=18`, 4 chunks, total 2.7294 sec
+- W8A16-BF16 microbench in this run:
+  - M=1,N=24576,K=4096: 0.001531 sec vs torch BF16 0.006206 sec, 4.0547x in targeted test; 0.001691 sec vs 0.004530 sec, 2.6796x in full suite.
+  - M=1,N=4096,K=12288: 0.000695 sec vs torch BF16 0.001417 sec, 2.0385x in targeted test; 0.000764 sec vs 0.002125 sec, 2.7828x in full suite.
+  - Current stable M=16,N=4096,K=12288 after reverting flattened scheduling: 0.008422 sec vs torch BF16 0.010644 sec, 1.2638x.
+  - Flattened M>1 scheduling experiment reached about 1.88x-2.09x on isolated M=16 down projection, but caused a native disconnect in full live `/chat`, so it was reverted.
+  - M=1,N=151936,K=4096: 0.009478 sec vs torch BF16 0.024562 sec, 2.5916x in full suite.
+  - Current stable code keeps the M==1 fast path and the previous per-row M>1 scheduling.
+- W4A16-BF16 microbench with AVX2 nibble unpack:
+  - M=1,N=12288,K=4096:
+    - per-row W4: 25,214,976 bytes, 3.9922x compression, 0.000698 sec, 3.3602x vs torch BF16, mean abs err 6.7858.
+    - W4G32: 31,457,280 bytes, 3.2x compression, 0.000971 sec, 2.4151x vs torch BF16, mean abs err 4.7618.
+    - W4G128: 26,738,688 bytes, 3.7647x compression, 0.000860 sec, 2.7268x vs torch BF16, mean abs err 5.6467.
+    - W8: 50,380,800 bytes, 1.998x compression, 0.000864 sec, 2.7139x vs torch BF16, mean abs err 0.3691.
+  - M=1,N=4096,K=12288:
+    - per-row W4: 25,182,208 bytes, 3.9974x compression, 0.001233 sec, 2.3089x vs torch BF16, mean abs err 12.2363.
+    - W4G32: 31,457,280 bytes, 3.2x compression, 0.001690 sec, 1.6848x vs torch BF16, mean abs err 8.3110.
+    - W4G128: 26,738,688 bytes, 3.7647x compression, 0.001391 sec, 2.0469x vs torch BF16, mean abs err 10.0582.
+    - W8: 50,348,032 bytes, 1.9993x compression, 0.001179 sec, 2.4147x vs torch BF16, mean abs err 0.6662.
+  - Per-row W4 is fastest/smallest. G32 has better error but too much decode overhead. G128 is the current balanced W4 format.
+- ABI/build:
+  - `abi.detect_isa()` reports `avx2`.
+  - `abi.runtime_info()` reports the actual loaded eCPU DLL path, version, ISA, `PILM_ECPU_LIB` override, and available kernel symbols.
+  - PyTorch reports CPU capability `AVX2` on the current Intel Core i9-14900K host.
+  - This CPU does not provide a native FP8 inference tensor path like a modern GPU tensor core or server AMX path; practical CPU acceleration here is W8 weight-only plus BF16/FP32 accumulation through AVX2 C kernels.
+  - CMake build uses MinGW GCC with `-O3 -march=native -fopenmp`.
+  - `scripts/build_ecpu_windows.ps1` builds the Windows DLL.
+  - Windows build script passes `-DECPU_NATIVE_ARCH=ON/OFF` as a single explicit argument.
+  - `scripts/build_ecpu_linux.sh` builds `libecpu.so` on Linux.
+  - `scripts/build_ecpu_linux.sh --raspi` disables `-march=native` for Raspberry Pi / portable ARM builds.
+  - `src\ecpu\build\libecpu.dll` is currently the stable W8 service DLL.
+  - `src\ecpu\build_w4\libecpu.dll` is currently used for W4 service modes.
+  - `src\ecpu\build_eattn\libecpu.dll` contains the experimental EAttn recurrent symbol.
+  - Fresh current-source builds with all experimental symbols are still slower on W8A16 target shapes, even with `ECPU_NATIVE_ARCH=ON`; do not overwrite the stable W8 service DLL until this is resolved.
+- Bench coverage:
+  - `python src\bench_suite.py --omp-threads 16` covers C F32, W8A16 BF16, W4 per-row, W4G32, W4G128, and lm_head microbenchmarks.
+  - `python src\bench_suite.py --full-model --max-new-tokens N --w8a32-cache-dir ... --w4a16-cache-dir ...` also covers BF16, W8, W8-all, W8-static, W4-static, and W4G128-static full-model paths.
+  - `python src\bench_w4_i4b8.py --lib src\ecpu\build_i4b8\libecpu.dll --n N --k K --omp-threads 24 --json --out artifacts\kernel_eval\NAME.json` covers the experimental W4 pre-unpacked interleaved8 decode kernel and writes reproducible JSON artifacts.
+  - `python src\bench_w4_b8.py --lib src\ecpu\build_w4b8\libecpu.dll --n N --k K --omp-threads 24 --json --out artifacts\kernel_eval\NAME.json` covers the experimental packed W4 blocked8xK16 decode kernel.
+  - `python src\bench_w4_swiglu_fused.py --lib src\ecpu\build_w4swiglu\libecpu.dll --hidden 4096 --intermediate 24576 --omp-threads 24 --json --out artifacts\kernel_eval\w4_swiglu_fused_4096x24576_24t.json` covers the experimental one-call W4 SwiGLU MLP fusion.
+
+- 24-thread W4 live-server soak on the stable service (PID 16988, `build_w4` DLL), `src/soak_w4_live.py`:
+  - 10 warm `/generate` runs, prompt `What is 2+2? Answer briefly.`, 16 tokens: 3.13, 3.13, 3.17, 3.16, 3.17, 3.21, 3.14, 3.16, 3.16, 3.16 chunks/sec; average 3.16, min 3.13, max 3.21.  `free_blocks` stayed at 127 across all 10 runs (no leak).
+  - 4-turn `/chat` session `soak_session`, 16 tokens/turn: turns produced msgs 2/4/6/8, `free_blocks` 124/122/119/117 (expected KV growth), speeds 3.17/2.85/2.64/2.67 (slows as session KV grows, expected).
+  - `/clear` then fresh `/chat`: `free_blocks` recovered 117 -> 125, first-token latency recovered 2.81s -> 1.57s.
+  - PID 16988 stayed healthy across the full soak; `runtime.kernel_backend` remained `ckernel_w4a16_bf16`.  Results saved to `artifacts/q8_eval/soak_stable_w4.json`.
+
+## Operating Recommendation
+
+- Use the persistent server for real work; repeated standalone 9B reloads can still native-exit during safetensors loading on Windows.
+- Use the live `w4a16-all` compressed bundle server when disk/RAM footprint matters most; current best measured steady output is about 4.87 tokens/sec, not 30 tokens/sec.
+- Use `w8a32-all` only as a speed/quality comparison path; the current live service is optimized around the compressed W4 bundle.
+- Use `w8a32` when keeping `lm_head` BF16 quality is more important.
+- Use `w8a32-static` when static quality preservation matters more than peak speed: it is slower than `w8a32-all` but keeps sensitive routing/output layers BF16.
+- Use `w4a16-static` when disk/RAM footprint matters most and some quality loss is acceptable. It currently reduces the static-policy quant cache to 2.465 GB and keeps sensitive modules BF16.
+- Use `w4a16-all` or `D:\Qwen3.5-9B-pilm-w4a16-all` when physical model size matters most. This is the first truly compressed piLM bundle, but quality risk is higher because every Linear, including `lm_head`, is W4.
+- Use `w4a16g128-static` as the current balanced W4 path when the extra 0.15 GB cache over per-row W4 is acceptable.
+- Avoid `w4a16g32-static` for speed-sensitive CPU decode; it is kept as a quality/format experiment.
+- Keep `PILM_PREFIX_CACHE=0` unless recurrent-state-aware prefix reuse is implemented.
+- Keep `ECPU_W8A16_PRECONVERT` unset; earlier tests showed some microbench wins but full-model regression.
+- Keep `PILM_LM_HEAD_ARGMAX` unset/`0`; direct greedy argmax is currently experimental and slower on the larger vocab-shaped benchmark.
+- Keep `--w8a16-m-flat` off for real service use; end-to-end restarted-server tests regressed despite good isolated M=16 microbenchmarks.
+- Keep `--omp-threads 24` for the current W4 bundle service on the i9-14900K; the latest W4 thread sweep picked 24 over 16 and 32.
+- Keep `--torch-interop-threads 1`; it reduced PyTorch task-pool contention and improved the latest live 16-token average to 2.7237 tokens/sec.
+- Keep `PILM_W4A16_Q8` unset/`0` for the live `w4a16-all` service.  The experimental `build_w4q8` int8-activation kernel is 5-8.5% faster end-to-end but systematically perturbs greedy sampling on top of int4 weights; it is available for speed experiments where sampling nondeterminism is acceptable, and a W8-weight + q8-activation path is the likely future use.
+- Keep `PILM_W8A16_Q8` unset/`0`.  The experimental `build_w8q8` int8-activation W8 kernel has now been full-model tested on the W8 bundle: 5 of 6 greedy runs diverged and end-to-end speed was slower (0.89-0.97x), so the q8 activation line is closed.
+- Do not pursue W4 "pre-unpack to int8" as the main layout path.  The experimental `ekernel_linear_w4a16_bf16_i4b8` / `build_i4b8` path is correctness-clean but slower than stable W4 and doubles weight bytes; the reproducible run artifacts are under `artifacts\kernel_eval\`; the useful next layout work must keep 4-bit density and improve the packed/super-block decode kernel instead.
+- Keep `PILM_W4_B8` unset/`0` on the live service.  The isolated `build_w4b8` blocked8xK16 layout is positive at the linear microbench level (same bytes and zero error, ~1.20x on MLP-shaped linears), but MLP-only full-model hot 64-token bench did **not** beat stable W4: b8 5.1373 chunks/sec vs stable 5.2382 chunks/sec. Treat b8 as useful layout evidence, not a deployment setting yet.
+- Keep `PILM_W4_SWIGLU_FUSED` unset/`0` for the live service.  The isolated `build_w4swiglu` one-call M=1 W4 SwiGLU MLP kernel is correctness-clean and gives a small module-level win (1.04x on hidden=4096/intermediate=24576), but this is not enough to explain or deliver the 8-10 t/s target; treat it as a validated slice for deeper tiled/super-block fusion work.
+- Use `PILM_LINEAR_ATTN_RECURRENT_BACKEND=ckernel` for the current W4 service; it produced a small end-to-end win in the latest 32-token bench.
+- Keep MTP speculative disabled by default. The implemented 3-draft path is correct/available, but BF16 MTP is slower and W4 MTP breaks acceptance.
+- Use `PILM_NORM_BACKEND=ckernel-all` only with the current W4 service if matching the latest measured config; otherwise treat norm C kernels as profiling/experiment knobs.
+- The same setting is exposed as `--norm-backend ckernel` on `src\cli.py`, `src\bench.py`, and `src\server.py`.
+- Recommended fast startup path: use `PILM_W8A32_CACHE=1`, `PILM_W8A32_CACHE_DIR=D:\Qwen3.5-9B\.pilm_cache\w8a32_st`, and `PILM_TRIM_WORKING_SET=0`.
+- Keep no-cache startup as a fallback if longer soak tests expose another cache-backed native exit.
+
+## Remaining Work
+
+1. The 30 tokens/sec target is not reached. Current best is about 4.87 tokens/sec total / 5.05 tokens/sec excluding first token on the compressed W4 bundle.
+2. To approach 30 tokens/sec, replace the current row-major W4 layout with a llama.cpp-style packed block/super-block layout and a kernel that avoids per-call nibble unpack overhead.
+3. Build a lower-cost MTP draft kernel. The 3-draft verifier is implemented, but BF16 draft compute is too expensive and W4 draft quantization loses acceptance.
+4. Fuse more of MLP into C: gate/up/down plus activation should avoid Python dispatch and intermediate tensor traffic.
+5. Move more linear-attention stages into a fused C path; recurrent-only C gives only a small improvement.
+6. Add NEON-specific W4A16 kernels and keep `scripts/build_ecpu_linux.sh --raspi` coverage for Raspberry Pi.
+7. **q8 activation line is CLOSED.** Both the W4+q8 (`ekernel_linear_w4a16_bf16_q8`, `build_w4q8`) and W8+q8 (`ekernel_linear_w8a16_bf16_q8`, `build_w8q8`, `PILM_W8A16_Q8=1`) kernels are verified faster at the microbench level but **neither is safe as a default** because int8 activation quantization perturbs greedy sampling. W4+q8 diverges from stable W4 at ~token 8; W8+q8 diverges from stable W8 at token 11-13 (5 of 6 full-model runs diverge; the W8 bundle and full-model greedy compare are now done — see the W8A16+q8 section above) and is actually **slower** end-to-end (0.89-0.97x). The argmax-stability microbench was a correct leading indicator: W8 absorbs *most* of the int8 activation error (flips only at near-ties, survives longer than W4) but does not eliminate it. Conclusion per user direction: stop investing main-line time in q8 activation; keep the switches experimental only. The 30 t/s gap is not closable by activation quantization.
+8. The W8 bundle at `D:\Qwen3.5-9B-pilm-w8a32-all` (9.77 GiB) is now built and load-verified, and the loader supports W8 bundles via the new branch in `load_weights_w8a32_from_safetensors` (points `cache_dir` at `bundle/linear_w8a32/`). This **unblocked** the full-model W8 greedy compare that was previously impossible. The W8 bundle is available for any future W8-side experiment (fused W8 MLP, etc.) without re-loading the 18 GB checkpoint.
+9. The 24-thread W4 live-server soak was run on the stable service (10 `/generate`, 4-turn `/chat`, `/clear` recovery) and was stable; a longer multi-hour soak is still desirable before declaring the config production-grade.
+10. Distance to the 30 t/s target: current best is ~4.87 t/s on the W4 bundle (live `/generate` ~3.16-3.45 t/s including HTTP/first-token). The q8 activation line is now fully evaluated end-to-end and **confirmed not to help** (W4+q8 and W8+q8 are both quality-divergent and W8+q8 is even slower end-to-end), so they close ~0 t/s of the ~25 t/s gap. The real remaining gap is **kernel/layout**, not activation quantization. The primary 30 t/s path is now: (a) a llama.cpp-style W4 super-block / K-quant layout with a prepacked decode kernel that avoids per-call nibble unpack, and (b) a C-fused MLP (gate/up matmul -> silu*up -> down matmul) to cut Python dispatch and intermediate tensor traffic — target a 2x MLP single-token-decode speedup first, then reassess end-to-end. The W8 bundle (`D:\Qwen3.5-9B-pilm-w8a32-all`) is available as the test bed for the fused-W8-MLP work without re-loading the 18 GB checkpoint.
+11. W4 pre-unpacked interleaved8 experiment result: `ekernel_linear_w4a16_bf16_i4b8` plus `pack_i4_rows_to_i8_interleaved8` was added and validated in isolated `src\ecpu\build_i4b8\libecpu.dll`. It preserves output versus stable W4 (`test_quant.py` max error 0.0 on the small case; model-shape benches max error 0.0-0.00390625) but is slower and uses 2x weight bytes. Latest 24-thread replay artifacts are `artifacts\kernel_eval\w4_i4b8_4096x4096_24t.json` (0.80x), `w4_i4b8_mlp_gate_up_24576x4096_24t.json` (0.82x), and `w4_i4b8_mlp_down_4096x12288_24t.json` (0.72x). Conclusion: simply pre-unpacking W4 to int8 is memory-bandwidth negative; continue with true 4-bit super-block/K-quant layout or C-fused MLP, not i4b8 as a default path.
+12. W4 one-call SwiGLU MLP fusion first slice: `ekernel_swiglu_w4a16_bf16` plus `PILM_W4_SWIGLU_FUSED=1` was added and validated in isolated `src\ecpu\build_w4swiglu\libecpu.dll`. It keeps packed W4 weights, supports M=1 decode, computes gate/up -> BF16 SwiGLU -> down in one C call, and matches the existing two-step W4 path exactly on the small correctness test. Model-shape bench artifact `artifacts\kernel_eval\w4_swiglu_fused_4096x24576_24t.json`: reference two-step 0.002910s, fused 0.002810s, 1.04x, max error 0.0. Conclusion: useful as a verified fused-MLP scaffold, but the win is too small by itself; the next fused path must tile across the true W4 super-block layout or fuse deeper to remove more memory traffic.
+13. W4 blocked8xK16 layout result: `ekernel_linear_w4a16_bf16_b8`, `pack_i4_rows_blocked8k16`, optional routes `PILM_W4_B8=1` (W4 SwiGLU MLP only) and `PILM_W4_B8_LINEAR=1` (standalone W4 Linear), and `src\bench_w4_b8.py` were added and validated in isolated `src\ecpu\build_w4b8\libecpu.dll`. It keeps W4 storage density (`b8_bytes_vs_q4=1.0`) and matches stable W4 exactly. 24-thread decode microbench results: N=4096,K=4096 stable 0.000290s vs b8 0.000285s (1.02x); MLP gate/up N=24576,K=4096 stable 0.001187s vs b8 0.000976s (1.22x); MLP down N=4096,K=12288 stable 0.000658s vs b8 0.000549s (1.20x). Artifacts: `artifacts\kernel_eval\w4_b8_4096x4096_24t.json`, `w4_b8_mlp_gate_up_24576x4096_24t.json`, `w4_b8_mlp_down_4096x12288_24t.json`. Full-model check: global b8 was slower on 32 tokens (4.1546 cps first run, 4.5348 cps warm vs stable 4.8680/4.9101); MLP-only b8 also trailed on hot 64-token bench (5.1373 cps vs stable 5.2382). Conclusion: b8 proves 4-bit blocked layout can improve isolated MLP linears, but it is not yet a deploy win; next work should prepack at bundle/export time and/or combine b8 with deeper fused MLP tiling so the layout win survives full-model scheduling and memory pressure.
+
+## llama.cpp speed-ruler attempt (2026-06-29, SUPPRESSED per user decision)
+
+A llama.cpp speed-ruler build was attempted to answer "can this i9-14900K even reach 30 t/s on Q4_K_M, or is 30 t/s unrealistic short-term". Outcome: **build succeeded, conversion was blocked, user chose to skip the ruler and go straight to self-built kernel work**.
+
+- **Build (DONE):** `D:\self-infer\refs\llama.cpp` built with MinGW gcc 15.2 + cmake 4.2, `GGML_NATIVE=ON` (auto-detected AVX2+FMA+AVX_VNNI; note MinGW `-march=native` maps to `alderlake` and emits `-mno-avx512*`, so AVX-512 is NOT enabled on this toolchain — the ruler would have been AVX2-class, same ISA as piLM's own kernels). Two build fixes were needed: (1) patched `vendor/cpp-httplib/httplib.cpp` `CreateFile2`/`CreateFileMappingFromApp` (Win8 app-model APIs undeclared in this MinGW `fileapi.h`) to `CreateFileW`/`CreateFileMappingW`; (2) added `-D_WIN32_WINNT=0x0A00 -DWINVER=0x0A00` to `CMAKE_C/CXX_FLAGS` to satisfy httplib's Win10 guard. Working binaries in `build-avx/bin/`: `llama-bench.exe`, `llama-quantize.exe`, `llama-cli.exe` (need MinGW runtime DLLs + `build-avx/bin` on PATH). `llama-server` is blocked by a UI-asset embed step (`llama-ui-embed` exe fails with 0xc0000139) — only relevant if a llama.cpp OpenAI-compatible backend is ever wanted.
+- **Architecture routing (solved):** the source `Qwen3.5-9B` is multimodal (`Qwen3_5ForConditionalGeneration` → routes to `Qwen3VLVisionModel`). For a clean text-decode ruler a patched-config mirror dir was set up (`text_config.architectures=["Qwen3_5ForCausalLM"]` → forces `Qwen3_5TextModel` / `QWEN35` arch). Dry-run confirmed the text-only QWEN35 path. The mirror was hardlinks to the original shards (no disk cost, originals unmodified) and has since been cleaned up.
+- **GGUF conversion (BLOCKED, then SKIPPED):** disk was the first blocker — D: had only 1.5 GB free (F16 intermediate needs 18.4 GB). User authorized emptying D:'s recycle bin; that alone was insufficient (a locked `.git` folder held most of it), so the rebuildable W8 artifacts were removed to reach 14 GB free: the W8 bundle (`D:\Qwen3.5-9B-pilm-w8a32-all`, 9.77 GiB) and the `w8a32_st` quant cache (`D:\Qwen3.5-9B\.pilm_cache\w8a32_st`, 7.94 GiB). **Both are rebuildable** (cache via checkpoint re-quantization, bundle via `scripts/export_pilm_quant_bundle_v2.py`) — but re-quantization hits the same memory wall while the W4 server is live. With 14 GB free the conversion was retried with `--outtype q8_0` (9 GB, smaller than F16) but then hit the **memory wall**: the converter's q8_0 quantization step tries to allocate one ~4 GB contiguous block (the lm_head/embed matrix) and torch's CPU allocator cannot get it while the W4 live server holds ~10 GB of the ~72 GB commit limit. `PYTORCH_ALLOC_CONF=expandable_segments:True` did not help (it's a single 4 GB tensor, not fragmentation).
+- **Decision (user):** skip the llama.cpp ruler entirely — do NOT stop the live server for a conversion maintenance window, and do NOT try further workarounds. Go straight to self-built kernel work. Consequence: there is **no measured hardware ceiling** for Q4_K_M on this CPU; the 30 t/s target is not validated as reachable, so it is no longer promised short-term. The intermediate self-built goal is **4.87 → 8-10 t/s** via W4 super-block layout + C-fused MLP (see Remaining Work #10 above).
+- **What was NOT touched:** the live W4 server (PID 16988) stayed up the whole time (`ok=true`, `w4a16-all`, `free_blocks=125`, no q8 symbols); `build_w4/libecpu.dll` unchanged; W4 caches (`w4a16_all`/`w4a16_st`/`w4a16g128_st`) and the W4 bundle intact; the original `D:\Qwen3.5-9B` checkpoint intact. The llama.cpp source tree and `build-avx/` binaries are kept for a future ruler run (would need either a live-server-down window or a larger page file to get past the conversion memory wall).
